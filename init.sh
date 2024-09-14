@@ -178,10 +178,15 @@ sendTelegram() {
   echo ""
   echo "===== SEND TO TELEGRAM BOT ====="
 
-  curl -F chat_id=$TELEGRAM_CHAT_ID \
+  if curl -F chat_id=$TELEGRAM_CHAT_ID \
      -F document=@final-result-$targetUrl.txt \
      -F caption="Recon result for $targetUrl" \
-  https://api.telegram.org/bot$TELEGRAM_BOT_ID/sendDocument
+     https://api.telegram.org/bot$TELEGRAM_BOT_ID/sendDocument \
+     > /dev/null 2>&1; then
+     echo "Sent!"
+  else
+     echo "Failed to send."
+  fi
 }
 
 # Main script flow
