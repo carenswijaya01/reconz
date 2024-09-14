@@ -83,7 +83,3 @@ Anew: https://github.com/tomnomnom/anew
 16 = Nuclei template: /http/default-logins
 
 17 = Nuclei template: /default-logins
-
-## To Do
-
-- Create telegram bot for notification

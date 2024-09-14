@@ -128,6 +128,11 @@ makeResult () {
   mkdir "$SAVE_DIR/$targetUrl"
   cd ./tmp-$targetUrl
   cat *.txt | anew final-result-$targetUrl.txt
+
+  if [ "$TELEGRAM_NOTIF" = true ]; then
+    sendTelegram
+  fi
+
   mv final-result-$targetUrl.txt "$SAVE_DIR/$targetUrl"
   cd ..
 }
@@ -159,10 +164,24 @@ showMenu() {
     echo ""
   fi
 
-  echo "$((total_runs + 1))) Make final result (anew)"
+  if [ "$TELEGRAM_NOTIF" = true ]; then
+    echo "$((total_runs + 1))) Make final result (anew) and send to Telegram"
+  else
+    echo "$((total_runs + 1))) Make final result (anew)"
+  fi
   echo "$((total_runs + 2))) Run all (1-$total_runs and make final result)"
   echo "$((total_runs + 3))) Remove temporary files"
   echo "$((total_runs + 4))) Exit"
+}
+
+sendTelegram() {
+  echo ""
+  echo "===== SEND TO TELEGRAM BOT ====="
+
+  curl -F chat_id=$TELEGRAM_CHAT_ID \
+     -F document=@final-result-$targetUrl.txt \
+     -F caption="Recon result for $targetUrl" \
+  https://api.telegram.org/bot$TELEGRAM_BOT_ID/sendDocument
 }
 
 # Main script flow
