@@ -31,6 +31,8 @@ Hakrawler: https://github.com/hakluke/hakrawler
 
 Anew: https://github.com/tomnomnom/anew
 
+Dirsearch: https://github.com/maurosoria/dirsearch
+
 ## Usage
 
 1. Copy and paste `.env.example` into `.env`.
@@ -40,13 +42,30 @@ Anew: https://github.com/tomnomnom/anew
 
    `NUCLEI_TEMPLATE_DIR` = define where nuclei-templates located at.
 
-3. Run the following command:
+   `TELEGRAM_NOTIF` = define that you want to get notification or not from your own bot.
+
+   `TELEGRAM_BOT_ID` = define your telegram bot id
+
+   `TELEGRAM_CHAT_ID` = define your telegram chat id
+
+3. Now you can include some headers if you want by creating a `header.txt` file. You don't need to change the header format, as this tool will automate that.
+
+   ```
+   Host: redacted.ltd
+   Cookie: SESSIONID=xxx
+   User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0
+   Accept: */*
+   Accept-Language: en-US,en;q=0.5
+   ...etc
+   ```
+
+4. Run the following command:
 
    ```
    sh ./init.sh
    ```
 
-4. Wait for the result. The result will be located in your `SAVE_DIR`.
+5. Wait for the result. The result will be located in your `SAVE_DIR`.
 
 ## Command Description
 
@@ -83,3 +102,5 @@ Anew: https://github.com/tomnomnom/anew
 16 = Nuclei template: /http/default-logins
 
 17 = Nuclei template: /default-logins
+
+18 = Dirsearch
