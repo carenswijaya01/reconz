@@ -6,245 +6,212 @@ if [ -f ".env" ]; then
 fi
 
 # Global Variables
-targetUrl=""
-escapedUrl=""
-total_runs=18
-
-# Initialize an empty variable to store header options
 HEADER_OPTIONS=""
 HEADER_OPTIONS_HAKRAWLER=""
+SAVE_DIR=${SAVE_DIR:-"./results"} # Default to ./results if not set in .env
+NUCLEI_TEMPLATE_DIR=${NUCLEI_TEMPLATE_DIR:-"$HOME/nuclei-templates"}
 
-# Loop through each line in header.txt and construct the -H options
+# Rate Limits (To prevent WAF bans like Cloudflare)
+RATE_LIMIT_NUCLEI=150
+RATE_LIMIT_DIRSEARCH=100
+
+# Load Headers
 if [ -f "header.txt" ] && [ -s "header.txt" ]; then
   while IFS= read -r header; do
     HEADER_OPTIONS="$HEADER_OPTIONS -H \"$header\""
-  done < "header.txt"
-
-  while IFS= read -r header; do
     HEADER_OPTIONS_HAKRAWLER="$HEADER_OPTIONS_HAKRAWLER -h \"$header\""
   done < "header.txt"
+  echo "[+] Loaded headers from header.txt"
 else
-  echo "No header.txt found or the file is empty, proceeding without headers..."
+  echo "[-] No header.txt found or empty, proceeding without headers..."
 fi
 
 # Show Intro
-intro() {
-  echo "  "
-  echo "  _ \  __|   __|   _ \   \ | __  / "
-  echo "    /  _|   (     (   | .  |    /  "
-  echo " _|_\ ___| \___| \___/ _|\_| ____| "
-  echo "                                   "
+echo "  _ \   __|   __|   _ \    \ | __  / "
+echo "    /  _|   (     (   | .  |    /  "
+echo " _|_\ ___| \___| \___/ _|\_| ____| "
+echo "                                   "
+echo "Automated Recon & DAST Pipeline"
+echo "-----------------------------------"
 
-  echo ""
-  echo "Prerequisite        : See README.md!\n"
-  echo "SAVE_DIR            : $SAVE_DIR"
-  echo "NUCLEI_TEMPLATE_DIR : $NUCLEI_TEMPLATE_DIR"
-}
+# Get Target
+read -p "Enter target (e.g., example.com OR example.com/myapp1): " rawTarget
 
-# Input Target URL
-getUrl() {
-  echo ""
-  echo "===== DEFINE TARGET URL ====="
-  read -p "Enter target url (without http/https): " targetUrl
-  echo ""
+# Clean up input (remove http:// or https:// if accidentally pasted)
+cleanTarget=$(echo "$rawTarget" | sed -e 's|^[^/]*//||' -e 's|/$||')
+escapedUrl=$(echo "$cleanTarget" | sed 's|/|_|g')
 
-  escapedUrl=$(echo "$targetUrl" | sed 's|/|_|g')
+TMP_DIR="./tmp-$escapedUrl"
+mkdir -p "$TMP_DIR"
+mkdir -p "$SAVE_DIR/$escapedUrl"
 
-  mkdir ./tmp-$escapedUrl
-}
+echo -e "\n================================================="
+echo " PHASE 1: Scope Definition & Live Hosts (with Naabu)"
+echo "================================================="
 
-# Execution
-run1() {
-  echo "\nNuclei template: /http/vulnerabilities/wordpress"
-  echo "$targetUrl" | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/http/vulnerabilities/wordpress" -o "./tmp-$escapedUrl/wpscann-$escapedUrl-nuclei.txt"
-}
+# Check if the target includes a path (a slash)
+if [[ "$cleanTarget" == *"/"* ]]; then
+    echo "[*] Specific path detected ($cleanTarget)."
+    echo "[*] Skipping Subfinder and Naabu to remain strictly in scope."
+    
+    rootDomain=$(echo "$cleanTarget" | awk -F/ '{print $1}')
+    
+    # Probe to see if the specific app is alive
+    echo "$cleanTarget" | httpx -silent $HEADER_OPTIONS > "$TMP_DIR/live_hosts.txt"
+    
+    IS_PATH_TARGET=true
+else
+    echo "[*] Root domain detected. Running Subfinder & Naabu Port Scan..."
+    # subfinder -> naabu (top 100 ports) -> httpx
+    subfinder -d "$cleanTarget" -all -silent | naabu -silent -top-ports 100 | httpx -silent $HEADER_OPTIONS > "$TMP_DIR/live_hosts.txt"
+    
+    rootDomain="$cleanTarget"
+    IS_PATH_TARGET=false
+fi
 
-run2() {
-  echo "\nNuclei template: /dast/vulnerabilities (with gau, gf, qsreplace)"
-  echo "$targetUrl" | gau --subs --blacklist png,jpg,gif,jpeg,swf,woff,svg,pdf,css,webp,woff,woff2,eot,ttf,otf,mp4 | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result1-$escapedUrl.txt"
-}
+if [ ! -s "$TMP_DIR/live_hosts.txt" ]; then
+    echo "[-] No live hosts found. Exiting."
+    rm -rf "$TMP_DIR"
+    exit 1
+fi
+echo "[+] Found $(wc -l < "$TMP_DIR/live_hosts.txt") live services."
 
-run3() {
-  echo "\nNuclei template: /dast/vulnerabilities (with gau, qsreplace)"
-  echo "$targetUrl" | gau --subs --blacklist png,jpg,gif,jpeg,swf,woff,svg,pdf,css,webp,woff,woff2,eot,ttf,otf,mp4 | urldedupe -s | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result2-$escapedUrl.txt"
-}
+echo -e "\n================================================="
+echo " PHASE 2: URL Harvesting & Strict Scope Filtering"
+echo "================================================="
 
-run4() {
-  echo "\nNuclei template: /dast/vulnerabilities (with waybackurls, gf, qsreplace)"
-  echo "$targetUrl" | waybackurls | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result3-$escapedUrl.txt"
-}
+SAFE_REGEX=$(echo "$cleanTarget" | sed 's/\./\\./g')
+STRICT_MATCH="^https?://${SAFE_REGEX}(/|\?|$)"
 
-run5() {
-  echo "\nNuclei template: /dast/vulnerabilities (with waybackurls, qsreplace)"
-  echo "$targetUrl" | waybackurls | urldedupe -s | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result4-$escapedUrl.txt"
-}
+if [ "$IS_PATH_TARGET" = true ]; then
+    echo "[*] STRICT SCOPE ENABLED: Locking all tools to $cleanTarget"
+    TARGET_URL="https://$cleanTarget"
+    
+    echo "[*] Running Katana..."
+    echo "$TARGET_URL" | katana -silent $HEADER_OPTIONS | grep -E "$STRICT_MATCH" > "$TMP_DIR/urls_katana.txt"
 
-run6() {
-  echo "\nNuclei template: /dast/vulnerabilities (with gauplus, gf, qsreplace)"
-  echo "$targetUrl" | gauplus | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result5-$escapedUrl.txt"
-}
+    echo "[*] Running Hakrawler..."
+    echo "$TARGET_URL" | hakrawler $HEADER_OPTIONS_HAKRAWLER -subs -u | grep -E "$STRICT_MATCH" > "$TMP_DIR/urls_hakrawler.txt"
 
-run7() {
-  echo "\nNuclei template: /dast/vulnerabilities (with gauplus, qsreplace)"
-  echo "$targetUrl" | gauplus | urldedupe -s | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result6-$escapedUrl.txt"
-}
+    echo "[*] Running GAU & Waybackurls..."
+    echo "$rootDomain" | gau --subs --blacklist png,jpg,gif,jpeg,swf,woff,svg,pdf,css,webp,woff,woff2,eot,ttf,otf,mp4 | grep -E "$STRICT_MATCH" > "$TMP_DIR/urls_gau.txt"
+    echo "$rootDomain" | waybackurls | grep -E "$STRICT_MATCH" > "$TMP_DIR/urls_wayback.txt"
 
-run8() {
-  echo "\nNuclei template: /dast/vulnerabilities (with paramspider and gf)"
-  baseUrl="${targetUrl%%/*}"
-  paramspider -d "$baseUrl"
-  cat "./results/$baseUrl.txt" | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result7-$escapedUrl.txt"
-}
+else
+    echo "[*] ROOT DOMAIN SCOPE: Crawling all discovered subdomains..."
+    
+    echo "[*] Running Katana..."
+    cat "$TMP_DIR/live_hosts.txt" | katana -silent $HEADER_OPTIONS > "$TMP_DIR/urls_katana.txt"
 
-run9() {
-  echo "\nNuclei template: /dast/vulnerabilities (with paramspider)"
-  baseUrl="${targetUrl%%/*}"
-  paramspider -d "$baseUrl"
-  cat "./results/$baseUrl.txt" | urldedupe -s | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result8-$escapedUrl.txt"
-}
+    echo "[*] Running Hakrawler..."
+    cat "$TMP_DIR/live_hosts.txt" | hakrawler $HEADER_OPTIONS_HAKRAWLER -subs -u > "$TMP_DIR/urls_hakrawler.txt"
 
-run10() {
-  echo "\nNuclei template: /dast/vulnerabilities (with katana, gf, qsreplace)"
-  echo "$targetUrl" | httpx $HEADER_OPTIONS | katana $HEADER_OPTIONS | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result9-$escapedUrl.txt"
-}
+    echo "[*] Running GAU & Waybackurls..."
+    cat "$TMP_DIR/live_hosts.txt" | gau --subs --blacklist png,jpg,gif,jpeg,swf,woff,svg,pdf,css,webp,woff,woff2,eot,ttf,otf,mp4 > "$TMP_DIR/urls_gau.txt"
+    cat "$TMP_DIR/live_hosts.txt" | waybackurls > "$TMP_DIR/urls_wayback.txt"
+fi
 
-run11() {
-  echo "\nNuclei template: /dast/vulnerabilities (with katana, qsreplace)"
-  echo "$targetUrl" | httpx $HEADER_OPTIONS | katana $HEADER_OPTIONS | urldedupe -s | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result10-$escapedUrl.txt"
-}
+echo "[*] Aggregating URLs..."
+cat "$TMP_DIR"/urls_*.txt | urldedupe -s > "$TMP_DIR/raw_all_urls.txt"
 
-run12() {
-  echo "\nNuclei template: /dast/vulnerabilities (with hakrawler, gf, qsreplace)"
-  echo "$targetUrl" | httpx $HEADER_OPTIONS | hakrawler $HEADER_OPTIONS_HAKRAWLER -subs -u | urldedupe -s | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result11-$escapedUrl.txt"
-}
+# Conditionally strip out dangerous state-changing or logout URLs
+if [ -n "$HEADER_OPTIONS" ]; then
+    echo "[*] Authentication headers detected! Removing dangerous endpoints (logout, delete, etc.)..."
+    cat "$TMP_DIR/raw_all_urls.txt" | grep -viE "logout|signout|logoff|delete|remove|destroy|revoke|kill|update" > "$TMP_DIR/all_urls.txt"
+else
+    echo "[*] Unauthenticated scan. Keeping all endpoints to test for Broken Access Control..."
+    mv "$TMP_DIR/raw_all_urls.txt" "$TMP_DIR/all_urls.txt"
+fi
 
-run13() {
-  echo "\nNuclei template: /dast/vulnerabilities (with hakrawler, qsreplace)"
-  echo "$targetUrl" | httpx $HEADER_OPTIONS | hakrawler $HEADER_OPTIONS_HAKRAWLER -subs -u | urldedupe -s | qsreplace FUZZ | grep FUZZ | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/dast/vulnerabilities" -dast -o "./tmp-$escapedUrl/result12-$escapedUrl.txt"
-}
+echo "[+] Total unique, safe, strictly in-scope URLs collected: $(wc -l < "$TMP_DIR/all_urls.txt")"
 
-run14() {
-  echo "\nNuclei template: /http/exposures"
-  echo "$targetUrl" | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/http/exposures" -o "./tmp-$escapedUrl/exposures-$escapedUrl.txt"
-}
+echo -e "\n================================================="
+echo " PHASE 3: Parameter Extraction & Fuzz Prep"
+echo "================================================="
+cat "$TMP_DIR/all_urls.txt" | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | anew "$TMP_DIR/fuzzable_urls.txt"
+echo "[+] Found $(wc -l < "$TMP_DIR/fuzzable_urls.txt") parameters to fuzz."
 
-run15() {
-  echo "\nNuclei template: /http/exposed-panels"
-  echo "$targetUrl" | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/http/exposed-panels" -o "./tmp-$escapedUrl/exposed-panels-$escapedUrl.txt"
-}
+echo -e "\n================================================="
+echo " PHASE 3.5: JavaScript Secret Scanning"
+echo "================================================="
+cat "$TMP_DIR/all_urls.txt" | grep -iE "\.js(\?|$)" > "$TMP_DIR/js_urls.txt"
 
-run16() {
-  echo "\nNuclei template: /http/default-logins"
-  echo "$targetUrl" | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/http/default-logins/" -o "./tmp-$escapedUrl/default-logins-1-$escapedUrl.txt"
-}
+if [ -s "$TMP_DIR/js_urls.txt" ]; then
+    echo "[+] Found $(wc -l < "$TMP_DIR/js_urls.txt") JS files. Scanning for hardcoded secrets..."
+    nuclei -l "$TMP_DIR/js_urls.txt" $HEADER_OPTIONS -tags exposure,token -rl $RATE_LIMIT_NUCLEI -o "$TMP_DIR/nuclei_secrets.txt"
+else
+    echo "[-] No JavaScript files found."
+fi
 
-run17() {
-  echo "\nNuclei template: /default-logins"
-  echo "$targetUrl" | nuclei $HEADER_OPTIONS -t "$NUCLEI_TEMPLATE_DIR/default-logins" -o "./tmp-$escapedUrl/default-logins-2-$escapedUrl.txt"
-}
+echo -e "\n================================================="
+echo " PHASE 4: Vulnerability Scanning (Nuclei)"
+echo "================================================="
 
-run18() {
-  echo "\nDirsearch"
-  # Check if header.txt exists and is not empty
-  if [ -f "header.txt" ] && [ -s "header.txt" ]; then
-    echo "header.txt found, using it with --headers-file"
-    dirsearch -u "$targetUrl" -e "*" --headers-file=header.txt -o "./tmp-$escapedUrl/dirsearch-$escapedUrl.txt"
-  else
-    echo "No header.txt found or the file is empty, proceeding without headers..."
-    dirsearch -u "$targetUrl" -e "*" -o "./tmp-$escapedUrl/dirsearch-$escapedUrl.txt"
-  fi
-}
+echo "[*] Running General Nuclei Scan (CVEs, Misconfigs, Exposed Panels, WordPress)..."
+nuclei -l "$TMP_DIR/live_hosts.txt" $HEADER_OPTIONS -tags cve,misconfig,panel,wordpress -rl $RATE_LIMIT_NUCLEI -o "$TMP_DIR/nuclei_general.txt"
 
-makeResult () {
-  echo ""
-  echo "===== GENERATING RESULT ====="
-  mkdir "$SAVE_DIR/$escapedUrl"
-  cd ./tmp-$escapedUrl
-  cat *.txt | anew final-result-$escapedUrl.txt
+echo "[*] Running DAST Nuclei Scan on parameters..."
+if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
+    cat "$TMP_DIR/fuzzable_urls.txt" | nuclei $HEADER_OPTIONS -tags dast -dast -rl $RATE_LIMIT_NUCLEI -o "$TMP_DIR/nuclei_dast.txt"
+else
+    echo "[-] No fuzzable parameters found, skipping DAST."
+fi
 
-  if [ "$TELEGRAM_NOTIF" = true ]; then
-    sendTelegram
-  fi
-
-  mv final-result-$escapedUrl.txt "$SAVE_DIR/$escapedUrl"
-  cd ..
-}
-
-removeTmp() {
-  echo ""
-  echo "===== REMOVING TMP FILES ====="
-  rm -rf ./results/$escapedUrl.txt
-  rm -rf ./tmp-$escapedUrl
-  echo "Done!"
-}
-
-showMenu() {
-  echo ""
-  echo "===== MAIN MENU ====="
-  echo "Target: $targetUrl"
-  echo "Choose an option:"
-  for i in $(seq 1 $total_runs); do
-    # Print options in columns
-    printf "%-15s" "$i) Run $i"
-
-    # New line every 3 options
-    if [ $(expr $i % 3) -eq 0 ]; then
-      echo ""
+echo -e "\n================================================="
+echo " PHASE 4.5: Advanced XSS Fuzzing (Dalfox)"
+echo "================================================="
+if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
+    echo "[*] Running Dalfox on extracted parameters..."
+    
+    # --skip-bav disables base-analyzing volume (makes it faster)
+    # --skip-mining prevents it from crawling, sticking strictly to our URL list
+    DALFOX_CMD="dalfox file \"$TMP_DIR/fuzzable_urls.txt\" -o \"$TMP_DIR/dalfox_results.txt\" --skip-bav --skip-mining"
+    
+    # Inject headers if they exist
+    if [ -n "$HEADER_OPTIONS" ]; then
+        echo "[!] WARNING: Running Dalfox Authenticated. Watch out for Stored XSS pollution!"
+        DALFOX_CMD="$DALFOX_CMD $HEADER_OPTIONS"
     fi
-  done
+    
+    eval "$DALFOX_CMD"
+    echo "[+] Dalfox completed."
+else
+    echo "[-] No fuzzable parameters found, skipping Dalfox."
+fi
 
-  if [ $(expr $total_runs % 3) -ne 0 ]; then
-    echo ""
-  fi
+echo -e "\n================================================="
+echo " PHASE 5: Directory Fuzzing (Dirsearch)"
+echo "================================================="
+echo "[*] Running Dirsearch (Rate limited to $RATE_LIMIT_DIRSEARCH req/s)..."
 
-  if [ "$TELEGRAM_NOTIF" = true ]; then
-    echo "$((total_runs + 1))) Make final result (anew) and send to Telegram"
-  else
-    echo "$((total_runs + 1))) Make final result (anew)"
-  fi
-  echo "$((total_runs + 2))) Run all (1-$total_runs and make final result)"
-  echo "$((total_runs + 3))) Remove temporary files"
-  echo "$((total_runs + 4))) Exit"
-}
+# Build base dirsearch command with plain text formatting for clean URL output
+DIRSEARCH_CMD="dirsearch -u \"https://$cleanTarget\" -e php,html,js,json,bak,txt,zip,tar.gz -x 400,404,500 -o \"$TMP_DIR/dirsearch_results.txt\" --max-rate $RATE_LIMIT_DIRSEARCH"
 
-sendTelegram() {
-  echo ""
-  echo "===== SEND TO TELEGRAM BOT ====="
+# If header.txt exists, inject it natively! No sudo needed.
+if [ -f "header.txt" ] && [ -s "header.txt" ]; then
+    echo "[+] Injecting authentication headers into Dirsearch..."
+    DIRSEARCH_CMD="$DIRSEARCH_CMD --headers-file=header.txt"
+fi
 
-  if curl -F chat_id=$TELEGRAM_CHAT_ID \
-     -F document=@final-result-$escapedUrl.txt \
-     -F caption="Recon result for $targetUrl" \
-     https://api.telegram.org/bot$TELEGRAM_BOT_ID/sendDocument \
-     > /dev/null 2>&1; then
-     echo "Sent!"
-  else
-     echo "Failed to send."
-  fi
-}
+eval "$DIRSEARCH_CMD"
+echo "[+] Dirsearch completed."
 
-# Main script flow
-intro
-getUrl
+echo -e "\n================================================="
+echo " PHASE 6: Compiling Results & Cleanup"
+echo "================================================="
+# Only compile the actual findings, not the massive raw URL lists
+cat "$TMP_DIR/live_hosts.txt" "$TMP_DIR"/nuclei_*.txt "$TMP_DIR/dalfox_results.txt" "$TMP_DIR/dirsearch_results.txt" 2>/dev/null | anew "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
 
-while true; do
-  showMenu
-  echo -n "Enter your choice: "
-  read choice
+if [ "$TELEGRAM_NOTIF" = true ]; then
+  echo "[*] Sending results to Telegram..."
+  curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
+       -F document=@"$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt" \
+       -F caption="Recon & DAST completed for $cleanTarget" \
+       "https://api.telegram.org/bot$TELEGRAM_BOT_ID/sendDocument" > /dev/null
+  echo "[+] Telegram notification sent!"
+fi
 
-  if [ "$choice" -ge 1 ] && [ "$choice" -le "$total_runs" ]; then
-    eval "run$choice"
-  else
-    case $choice in
-      $((total_runs + 1))) makeResult ;;
-      $((total_runs + 2)))
-        for i in $(seq 1 $total_runs); do
-          eval "run$i"
-        done
-        makeResult
-        ;;
-      $((total_runs + 3))) removeTmp ;;
-      $((total_runs + 4))) echo "Exiting..."; exit 0 ;;
-      *) echo "Invalid option. Please try again." ;;
-    esac
-  fi
-done
+echo "[*] Cleaning up temporary files..."
+rm -rf "$TMP_DIR"
+
+echo "[+] Pipeline Complete! Results saved to $SAVE_DIR/$escapedUrl/"
