@@ -1,4 +1,6 @@
 .env
 tmp-*
 results
-header.txt
+header.txt*
+!header.example
+*wordlist*
