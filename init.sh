@@ -239,6 +239,49 @@ if command -v paramspider &> /dev/null; then
     fi
 fi
 
+echo "[*] Running targeted API discovery (ffuf)..."
+if command -v ffuf &> /dev/null; then
+    
+    # Intelligently locate the SecLists API wordlist (Kali native paths first)
+    API_WORDLIST=""
+    if [ -f "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt" ]; then
+        API_WORDLIST="/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"
+    elif [ -f "/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt" ]; then
+        API_WORDLIST="/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt"
+    elif [ -f "api_wordlist.txt" ]; then
+        API_WORDLIST="api_wordlist.txt"
+    else
+        echo "[*] Local SecLists not found. Downloading fallback API wordlist..."
+        wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt -O api_wordlist.txt
+        API_WORDLIST="api_wordlist.txt"
+    fi
+    
+    # We use ffuf's multi-wordlist feature to test every live host against the API wordlist.
+    # WAF SAFETY: We use process substitution <(...) to instantly strip dangerous words before ffuf runs.
+    FFUF_CMD="ffuf -w \"$TMP_DIR/live_hosts.txt:HOST\" -w <(grep -viE 'logout|signout|delete|remove|destroy|revoke|kill|update' \"$API_WORDLIST\"):FUZZ -u HOST/FUZZ -mc 200,201,301,302,401,403,405 -rate $RATE_LIMIT_DIRSEARCH -of csv -o \"$TMP_DIR/ffuf_api.csv\" -t 50"
+    
+    # Inject authentication headers natively into ffuf
+    if [ -f "header.txt" ] && [ -s "header.txt" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(echo "$line" | tr -d '\r')
+            if [ -n "$line" ]; then
+                FFUF_CMD="$FFUF_CMD -H \"$line\""
+            fi
+        done < "header.txt"
+    fi
+    
+    # Run ffuf and hide the noisy output from the terminal
+    eval "$FFUF_CMD" > /dev/null 2>&1
+    
+    # Extract the discovered URLs from ffuf's CSV output (skipping the header row)
+    if [ -f "$TMP_DIR/ffuf_api.csv" ]; then
+        awk -F',' 'NR>1 {print $3}' "$TMP_DIR/ffuf_api.csv" > "$TMP_DIR/urls_ffuf.txt"
+        echo "[+] ffuf found $(wc -l < "$TMP_DIR/urls_ffuf.txt") API endpoints using local SecLists!"
+    fi
+else
+    echo "[-] ffuf not installed, skipping API discovery..."
+fi
+
 echo "[*] Aggregating URLs..."
 cat "$TMP_DIR"/urls_*.txt 2>/dev/null | grep -E "$STRICT_MATCH" | urldedupe -s > "$TMP_DIR/raw_all_urls.txt"
 
