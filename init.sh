@@ -345,7 +345,7 @@ if command -v x8 &> /dev/null; then
     else
         # -c 100: concurrency, -O url: format output directly as raw URLs, -o: output file
         # Notice we are executing x8 dynamically, so we must manually rebuild the string for eval
-        X8_CMD="x8 -u \"$TMP_DIR/all_urls.txt\" -w x8_wordlist.txt -c 100 -X GET POST -O url -o \"$TMP_DIR/x8_results.txt\""
+        X8_CMD="x8 -u \"$TMP_DIR/all_urls.txt\" --reflected-only -w x8_wordlist.txt -c 100 -X GET POST -O url -o \"$TMP_DIR/x8_results.txt\""
         
         # Inject headers natively (x8 uses -H)
         if [ ${#HEADER_ARGS[@]} -gt 0 ]; then
