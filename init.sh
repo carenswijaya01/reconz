@@ -242,13 +242,14 @@ fi
 echo "[*] Aggregating URLs..."
 cat "$TMP_DIR"/urls_*.txt 2>/dev/null | grep -E "$STRICT_MATCH" | urldedupe -s > "$TMP_DIR/raw_all_urls.txt"
 
-# Conditionally strip out dangerous state-changing or logout URLs
+# Conditionally strip out dangerous state-changing, logout URLs, and static directories
 if [ ${#HEADER_ARGS[@]} -gt 0 ]; then
-    echo "[*] Authentication headers detected! Removing dangerous endpoints (logout, delete, etc.) and static assets..."
-    cat "$TMP_DIR/raw_all_urls.txt" | grep -viE "\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|pdf|ico|webp|mp4|zip|tar|gz)(\?|$)" | grep -viE "logout|signout|logoff|delete|remove|destroy|revoke|kill|update" > "$TMP_DIR/all_urls.txt"
+    echo "[*] Authentication headers detected! Removing dangerous endpoints and static assets..."
+    cat "$TMP_DIR/raw_all_urls.txt" | grep -viE "\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|pdf|ico|webp|mp4|zip|tar|gz)(\?|$)" | grep -viE "logout|signout|logoff|delete|remove|destroy|revoke|kill|update|/assets/" > "$TMP_DIR/all_urls.txt"
 else
-    echo "[*] Unauthenticated scan. Removing static assets (keeping all endpoints to test for Broken Access Control)..."
-    cat "$TMP_DIR/raw_all_urls.txt" | grep -viE "\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|pdf|ico|webp|mp4|zip|tar|gz)(\?|$)" > "$TMP_DIR/all_urls.txt"
+    echo "[*] Unauthenticated scan. Removing static assets..."
+    # Add the /assets/ block here too!
+    cat "$TMP_DIR/raw_all_urls.txt" | grep -viE "\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|pdf|ico|webp|mp4|zip|tar|gz)(\?|$)" | grep -vi "/assets/" > "$TMP_DIR/all_urls.txt"
 fi
 
 echo "[+] Total unique, safe, strictly in-scope URLs collected: $(wc -l < "$TMP_DIR/all_urls.txt")"
@@ -395,7 +396,7 @@ if command -v sqlmap &> /dev/null; then
         # Create a clean target list replacing FUZZ with empty to let sqlmap dynamically test
         cat "$TMP_DIR/fuzzable_urls.txt" | sed 's/FUZZ//g' | urldedupe -s > "$TMP_DIR/sqlmap_targets.txt"
         
-        SQLMAP_CMD="sqlmap -m \"$TMP_DIR/sqlmap_targets.txt\" --batch --random-agent --level=3 --risk=3 --tamper=between --dbs -o --output-dir=\"$SAVE_DIR/$escapedUrl/sqlmap\""
+        SQLMAP_CMD="sqlmap -m \"$TMP_DIR/sqlmap_targets.txt\" --batch --random-agent --retries=1 --level=3 --risk=3 --tamper=between --dbs -o --output-dir=\"$SAVE_DIR/$escapedUrl/sqlmap\""
         
         if [ -n "$SQLMAP_DBMS" ]; then
             SQLMAP_CMD="$SQLMAP_CMD --dbms=\"$SQLMAP_DBMS\""
@@ -447,29 +448,36 @@ else
 fi
 
 echo -e "\n================================================="
-echo " PHASE 5: Directory & File Fuzzing (Dirsearch)"
+echo " PHASE 5: Directory & File Fuzzing (Feroxbuster)"
 echo "================================================="
 load_headers
 check_auth_status
-echo "[*] Running Dirsearch (Rate limited to $RATE_LIMIT_DIRSEARCH req/s)..."
+echo "[*] Running Feroxbuster (Rate limited to $RATE_LIMIT_DIRSEARCH req/s)..."
 
-# Build base dirsearch command with plain text formatting for clean URL output
-DIRSEARCH_CMD="dirsearch -l \"$TMP_DIR/live_hosts.txt\" -e php,html,js,json,bak,txt,zip,tar.gz -x 400,403,404,500 -o \"$TMP_DIR/dirsearch_results.txt\" --max-rate $RATE_LIMIT_DIRSEARCH"
+if command -v feroxbuster &> /dev/null; then
+    FEROX_CMD="feroxbuster --stdin -x php,html,js,json,bak,txt,zip,tar.gz -C 400,403,404,500 --rate-limit $RATE_LIMIT_DIRSEARCH --dont-scan '.*(logout|signout|logoff|delete|remove|destroy|revoke|kill|update).*' -q -o \"$TMP_DIR/feroxbuster_results.txt\""
 
-# If header.txt exists, inject it natively! No sudo needed.
-if [ -f "header.txt" ] && [ -s "header.txt" ]; then
-    echo "[+] Injecting authentication headers into Dirsearch..."
-    DIRSEARCH_CMD="$DIRSEARCH_CMD --headers-file=header.txt"
+    if [ -f "header.txt" ] && [ -s "header.txt" ]; then
+        echo "[+] Injecting authentication headers into Feroxbuster..."
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(echo "$line" | tr -d '\r')
+            if [ -n "$line" ]; then
+                FEROX_CMD="$FEROX_CMD -H \"$line\""
+            fi
+        done < "header.txt"
+    fi
+
+    eval "cat \"$TMP_DIR/live_hosts.txt\" | $FEROX_CMD"
+    echo "[+] Feroxbuster completed."
+else
+    echo "[-] feroxbuster not installed. Please install it to run this phase."
 fi
-
-eval "$DIRSEARCH_CMD"
-echo "[+] Dirsearch completed."
 
 echo -e "\n================================================="
 echo " PHASE 6: Compiling Results & Cleanup"
 echo "================================================="
 # Only compile the actual findings, not the massive raw URL lists
-cat "$TMP_DIR/live_hosts_info.txt" "$TMP_DIR"/nuclei_*.txt "$TMP_DIR/subzy_results.txt" "$TMP_DIR/dalfox_results.txt" "$TMP_DIR/dirsearch_results.txt" 2>/dev/null | anew "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
+cat "$TMP_DIR/live_hosts_info.txt" "$TMP_DIR"/nuclei_*.txt "$TMP_DIR/subzy_results.txt" "$TMP_DIR/dalfox_xss.txt" "$TMP_DIR/feroxbuster_results.txt" 2>/dev/null | anew "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
 
 if [ "$TELEGRAM_NOTIF" = true ]; then
   echo "[*] Sending results to Telegram..."
