@@ -343,11 +343,15 @@ if command -v x8 &> /dev/null; then
         echo "    wget -q https://raw.githubusercontent.com/s0md3v/Arjun/master/arjun/db/small.txt -O x8_wordlist.txt"
         echo "[-] Skipping x8 for now until x8_wordlist.txt exists..."
     else
-        # -c 100: concurrency, -O url: format output directly as raw URLs, -o: output file
-        # Notice we are executing x8 dynamically, so we must manually rebuild the string for eval
-        X8_CMD="x8 -u \"$TMP_DIR/all_urls.txt\" --reflected-only -w x8_wordlist.txt -c 100 -X GET POST -O url -o \"$TMP_DIR/x8_results.txt\""
+        # 1. WAF EVASION: Strip aggressive parameters that instantly trigger WAFs like FortiGate
+        echo "[*] Sanitizing x8 wordlist to evade WAF signatures..."
+        grep -viE "^(phpinfo|tftp|mkfile|exec|cmd|system|eval|shell|daemon|passwd|shadow|boot|config)$" x8_wordlist.txt > x8_clean.txt
         
-        # Inject headers natively (x8 uses -H)
+        # 2. Run x8 with lower concurrency (-c 20 instead of 100) to avoid rate-based WAF blocks
+        # We output to a raw file first so we can verify the findings
+        X8_CMD="x8 -u \"$TMP_DIR/all_urls.txt\" -w x8_clean.txt -c 20 -X GET POST -O url -o \"$TMP_DIR/x8_raw.txt\""
+        
+        # Inject headers natively
         if [ ${#HEADER_ARGS[@]} -gt 0 ]; then
             for header in "${HEADER_ARGS[@]}"; do
                 X8_CMD="$X8_CMD \"$header\""
@@ -358,11 +362,13 @@ if command -v x8 &> /dev/null; then
             echo "[-] x8 encountered an error or no parameters were found."
         }
         
-        if [ -s "$TMP_DIR/x8_results.txt" ]; then
-            echo "[+] Hidden parameters found by x8!"
-            # Since we used `-O url`, the file contains pure URLs with parameters (e.g., https://domain/?admin=)
-            # We use qsreplace to safely inject FUZZ into the empty parameters, preventing path corruption
-            cat "$TMP_DIR/x8_results.txt" | qsreplace FUZZ | grep FUZZ | urldedupe -s >> "$TMP_DIR/fuzzable_urls.txt"
+        if [ -s "$TMP_DIR/x8_raw.txt" ]; then
+            echo "[+] Filtering x8 false-positives caused by WAF blocks..."
+            # 3. WAF BUFFER: Use httpx to check the URLs x8 found. 
+            # If the WAF blocked it, it will return 403, 406, or 429. -fc filters those out!
+            cat "$TMP_DIR/x8_raw.txt" | httpx -silent "${HEADER_ARGS[@]}" -fc 400,403,406,429 | qsreplace FUZZ | grep FUZZ | urldedupe -s >> "$TMP_DIR/fuzzable_urls.txt"
+            
+            echo "[+] x8 parameters verified and added to fuzzing queue."
         fi
     fi
 else
