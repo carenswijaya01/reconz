@@ -345,7 +345,7 @@ if command -v x8 &> /dev/null; then
     else
         # 1. WAF EVASION: Strip aggressive parameters that instantly trigger WAFs like FortiGate
         echo "[*] Sanitizing x8 wordlist to evade WAF signatures..."
-        grep -viE "^(phpinfo|tftp|mkfile|exec|cmd|system|eval|shell|daemon|passwd|shadow|boot|config)$" x8_wordlist.txt > x8_clean.txt
+        grep -viE "^(phpinfo|tftp|mkfile|exec|cmd|system|eval|shell|daemon|passwd|shadow|boot|config|mkdir|rownum|user_password|user_group|sleep|delay|benchmark|waitfor)$" x8_wordlist.txt > x8_clean.txt
         
         # 2. Run x8 with lower concurrency (-c 20 instead of 100) to avoid rate-based WAF blocks
         # We output to a raw file first so we can verify the findings
