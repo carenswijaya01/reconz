@@ -6,14 +6,43 @@ if [ -f ".env" ]; then
 fi
 
 # Global Variables
-HEADER_OPTIONS=""
-HEADER_OPTIONS_HAKRAWLER=""
 SAVE_DIR=${SAVE_DIR:-"./results"} # Default to ./results if not set in .env
 NUCLEI_TEMPLATE_DIR=${NUCLEI_TEMPLATE_DIR:-"$HOME/nuclei-templates"}
 
 # Rate Limits (To prevent WAF bans like Cloudflare)
-RATE_LIMIT_NUCLEI=150
-RATE_LIMIT_DIRSEARCH=100
+RATE_LIMIT_NUCLEI=0
+RATE_LIMIT_DIRSEARCH=0
+
+# Phase Timing Helper
+PHASE_START_TIME=0
+phase_start() {
+    PHASE_START_TIME=$(date +%s)
+    echo -e "\n================================================="
+    echo " $1"
+    echo "================================================="
+}
+
+phase_end() {
+    local elapsed=$(( $(date +%s) - PHASE_START_TIME ))
+    local mins=$(( elapsed / 60 ))
+    local secs=$(( elapsed % 60 ))
+    if [ $mins -gt 0 ]; then
+        echo "[⏱] Phase completed in ${mins}m ${secs}s"
+    else
+        echo "[⏱] Phase completed in ${secs}s"
+    fi
+}
+
+# Trap handler: preserve tmp files for resume on Ctrl+C or crash
+cleanup() {
+    echo -e "\n[!] Interrupted! Cleaning up child processes..."
+    kill 0 2>/dev/null
+    if [ -n "${TMP_DIR:-}" ]; then
+        echo "[*] Temporary files preserved in $TMP_DIR for resume."
+    fi
+    exit 130
+}
+trap cleanup INT TERM
 
 # Load Headers (Dynamic Function)
 load_headers() {
@@ -29,8 +58,11 @@ load_headers() {
     fi
 }
 
-# Check Auth Status (Failsafe)
+# Check Auth Status (Failsafe) - skippable with --no-pause
 check_auth_status() {
+    if [ "$SKIP_AUTH_PAUSE" = true ]; then
+        return
+    fi
     if [ ${#HEADER_ARGS[@]} -gt 0 ]; then
         echo -e "\n[*] PAUSE: We are about to start a heavy fuzzing phase."
         echo "[*] If your session cookie might expire soon, this is your chance to update it."
@@ -62,11 +94,25 @@ echo "-----------------------------------"
 # Check for required tools
 check_tool() {
   if ! command -v $1 &> /dev/null; then
-    echo "[-] Warning: $1 is not installed or not in PATH. Some phases may be skipped."
+    echo "[-] Warning: $1 is not installed or not in PATH."
+    return 1
   fi
+  return 0
 }
+
+MISSING_CRITICAL=false
+echo "[*] Checking critical tools..."
+for tool in httpx nuclei katana hakrawler gau waybackurls gf qsreplace urldedupe anew subfinder naabu; do
+    if ! check_tool $tool; then
+        MISSING_CRITICAL=true
+    fi
+done
+if [ "$MISSING_CRITICAL" = true ]; then
+    echo "[!] WARNING: Some critical tools are missing. The pipeline may fail or skip phases."
+fi
+
 echo "[*] Checking optional elite tools..."
-for tool in subzy arjun x8 sqlmap paramspider; do
+for tool in subzy x8 sqlmap paramspider assetfinder feroxbuster ffuf dalfox; do
   check_tool $tool
 done
 
@@ -75,6 +121,8 @@ done
 rawTarget=""
 SQLMAP_DBMS=""
 INTERACTIVE=true
+SKIP_DIRSCAN=false
+SKIP_AUTH_PAUSE=false
 
 if [ "$#" -gt 0 ]; then
     INTERACTIVE=false
@@ -82,9 +130,18 @@ if [ "$#" -gt 0 ]; then
         case $1 in
             --url|-u) rawTarget="$2"; shift ;;
             --dbms|-d) SQLMAP_DBMS="$2"; shift ;;
+            --skip-dir) SKIP_DIRSCAN=true ;;
+            --no-pause) SKIP_AUTH_PAUSE=true ;;
             --help|-h) 
-                echo "Usage: $0 --url <target> [--dbms <dbms_list>]"
-                echo "Example: $0 --url https://example.com --dbms MySQL,PostgreSQL"
+                echo "Usage: $0 --url <target> [--dbms <dbms_list>] [--skip-dir] [--no-pause]"
+                echo "Example: $0 --url https://example.com --dbms MySQL --skip-dir --no-pause"
+                echo ""
+                echo "Options:"
+                echo "  --url, -u       Target URL or domain"
+                echo "  --dbms, -d      SQLMap DBMS hint (e.g., MySQL, PostgreSQL)"
+                echo "  --skip-dir      Skip Phase 5 (directory fuzzing)"
+                echo "  --no-pause      Skip header-refresh pauses between phases"
+                echo "  --help, -h      Show this help message"
                 exit 0
                 ;;
             *) echo "[-] Unknown parameter passed: $1"; exit 1 ;;
@@ -96,6 +153,15 @@ fi
 # Fallback to interactive prompts if target was not provided via arguments
 if [ -z "$rawTarget" ]; then
     read -p "Enter target (e.g., example.com OR https://example.com/myapp1): " rawTarget
+fi
+
+# Ask interactively if they want to run the long directory scan
+if [ "$INTERACTIVE" = true ]; then
+    echo ""
+    read -p "Run deep directory fuzzing (Phase 5)? This can take a long time. (y/N): " run_dir
+    if [[ ! "$run_dir" =~ ^[Yy]$ ]]; then
+        SKIP_DIRSCAN=true
+    fi
 fi
 
 # Clean up input (remove http:// or https:// if accidentally pasted)
@@ -119,9 +185,9 @@ TMP_DIR="./tmp-$escapedUrl"
 mkdir -p "$TMP_DIR"
 mkdir -p "$SAVE_DIR/$escapedUrl"
 
-echo -e "\n================================================="
-echo " PHASE 1: Scope Definition & Live Hosts (with Naabu)"
-echo "================================================="
+PIPELINE_START=$(date +%s)
+
+phase_start "PHASE 1: Scope Definition & Live Hosts (with Naabu)"
 
 # Check if the target includes a path (a slash)
 if [[ "$cleanTarget" == *"/"* ]]; then
@@ -139,7 +205,13 @@ else
     
     # Ensure the target itself is always in the list, even if subfinder finds nothing
     echo "$cleanTarget" > "$TMP_DIR/subs.txt"
+    
+    # Notice the >> so it APPENDS without deleting the line above!
     subfinder -d "$cleanTarget" -all -silent >> "$TMP_DIR/subs.txt" 2>/dev/null
+    
+    if command -v assetfinder &> /dev/null; then
+        assetfinder --subs-only "$cleanTarget" >> "$TMP_DIR/subs.txt" 2>/dev/null
+    fi
     
     # Sort unique subdomains -> naabu (top 100 ports) -> httpx
     sort -u "$TMP_DIR/subs.txt" | naabu -silent -top-ports 100 | httpx -silent "${HEADER_ARGS[@]}" -sc -title -tech-detect -ip > "$TMP_DIR/live_hosts_info.txt"
@@ -163,10 +235,9 @@ if [ ! -s "$TMP_DIR/live_hosts.txt" ]; then
     echo "https://$cleanTarget" > "$TMP_DIR/live_hosts_info.txt"
 fi
 echo "[+] Proceeding with $(wc -l < "$TMP_DIR/live_hosts.txt") live service(s)."
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 1.5: Subdomain Takeover (Subzy)"
-echo "================================================="
+phase_start "PHASE 1.5: Subdomain Takeover (Subzy)"
 if command -v subzy &> /dev/null; then
     echo "[*] Checking for Subdomain Takeovers..."
     # Run on all subdomains found, even dead ones, as they are prime targets for takeover
@@ -181,10 +252,9 @@ if command -v subzy &> /dev/null; then
 else
     echo "[-] subzy not installed, skipping..."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 2: URL Harvesting & Strict Scope Filtering"
-echo "================================================="
+phase_start "PHASE 2: URL Harvesting & Strict Scope Filtering"
 
 SAFE_REGEX=$(echo "$cleanTarget" | sed 's/\./\\./g')
 STRICT_MATCH="^https?://${SAFE_REGEX}(/|\?|$)"
@@ -244,21 +314,22 @@ if command -v ffuf &> /dev/null; then
     
     # Intelligently locate the SecLists API wordlist (Kali native paths first)
     API_WORDLIST=""
-    if [ -f "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt" ]; then
-        API_WORDLIST="/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"
-    elif [ -f "/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt" ]; then
-        API_WORDLIST="/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt"
+    if [ -f "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt" ]; then
+        API_WORDLIST="/usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt"
+    elif [ -f "/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints-res.txt" ]; then
+        API_WORDLIST="/usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints-res.txt"
     elif [ -f "api_wordlist.txt" ]; then
         API_WORDLIST="api_wordlist.txt"
     else
         echo "[*] Local SecLists not found. Downloading fallback API wordlist..."
-        wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt -O api_wordlist.txt
+        wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints-res.txt -O api_wordlist.txt
         API_WORDLIST="api_wordlist.txt"
     fi
     
     # We use ffuf's multi-wordlist feature to test every live host against the API wordlist.
     # WAF SAFETY: We use process substitution <(...) to instantly strip dangerous words before ffuf runs.
-    FFUF_CMD="ffuf -w \"$TMP_DIR/live_hosts.txt:HOST\" -w <(grep -viE 'logout|signout|delete|remove|destroy|revoke|kill|update' \"$API_WORDLIST\"):FUZZ -u HOST/FUZZ -mc 200,201,301,302,401,403,405 -rate $RATE_LIMIT_DIRSEARCH -of csv -o \"$TMP_DIR/ffuf_api.csv\" -t 50"
+    # BUG FIX: was referencing non-existent ffuf_hosts.txt, now uses live_hosts.txt
+    FFUF_CMD="ffuf -w \"$TMP_DIR/live_hosts.txt:HOST\" -w <(grep -viE 'logout|signout|delete|remove|destroy|revoke|kill|update' \"$API_WORDLIST\"):FUZZ -u HOST/FUZZ -mc 200,201,301,302,401,403,405 -ac -rate $RATE_LIMIT_DIRSEARCH -of csv -o \"$TMP_DIR/ffuf_api.csv\" -t 50 -H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\""
     
     # Inject authentication headers natively into ffuf
     if [ -f "header.txt" ] && [ -s "header.txt" ]; then
@@ -297,15 +368,20 @@ fi
 
 echo "[+] Total unique, safe, strictly in-scope URLs collected: $(wc -l < "$TMP_DIR/all_urls.txt")"
 
-echo -e "\n================================================="
-echo " PHASE 3: Parameter Extraction & Fuzz Prep"
-echo "================================================="
+# Filter out dead OSINT links before they reach the fuzzers (prevents SQLMap/Dalfox time waste)
+echo "[*] Verifying URLs are alive to prevent wasting SQLMap/Dalfox time..."
+cat "$TMP_DIR/all_urls.txt" | httpx -silent "${HEADER_ARGS[@]}" -mc 200,201,301,302,307,401,403,405 -t 100 > "$TMP_DIR/alive_urls.txt"
+mv "$TMP_DIR/alive_urls.txt" "$TMP_DIR/all_urls.txt"
+
+echo "[+] Alive URLs passed to fuzzing phases: $(wc -l < "$TMP_DIR/all_urls.txt")"
+phase_end
+
+phase_start "PHASE 3: Parameter Extraction & Fuzz Prep"
 cat "$TMP_DIR/all_urls.txt" | gf lfi redirect sqli-error sqli ssrf ssti xss xxe | qsreplace FUZZ | grep FUZZ | anew "$TMP_DIR/fuzzable_urls.txt"
 echo "[+] Found $(wc -l < "$TMP_DIR/fuzzable_urls.txt") parameters to fuzz."
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 3.5: JavaScript Secret Scanning"
-echo "================================================="
+phase_start "PHASE 3.5: JavaScript Secret Scanning"
 # We extract JS URLs from the RAW list since we just stripped them from all_urls.txt
 cat "$TMP_DIR/raw_all_urls.txt" | grep -iE "\.js(\?|$)" > "$TMP_DIR/js_urls.txt"
 
@@ -315,68 +391,12 @@ if [ -s "$TMP_DIR/js_urls.txt" ]; then
 else
     echo "[-] No JavaScript files found."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 3.8: Hidden Parameter Discovery (Arjun)"
-echo "================================================="
-load_headers
-check_auth_status
-if command -v arjun &> /dev/null; then
-    echo "[*] Finding hidden parameters on live hosts..."
-    # Run Arjun on GET, POST, JSON, and XML to aggressively discover parameters
-    ARJUN_CMD="arjun -i \"$TMP_DIR/all_urls.txt\" -t 10 -m GET,POST,JSON,XML -oT \"$TMP_DIR/arjun_results.txt\""
-    if [ ${#HEADER_ARGS[@]} -gt 0 ] && [ -f "header.txt" ]; then
-        echo "[*] Injecting authentication headers into Arjun..."
-        # Parse header.txt into a JSON object for Arjun using awk (no Python/jq needed)
-        ARJUN_HEADERS_JSON=$(awk '
-        BEGIN { printf "{" }
-        {
-            sub(/\r$/, "")
-            idx = index($0, ":")
-            if (idx > 0) {
-                k = substr($0, 1, idx-1); v = substr($0, idx+1)
-                sub(/^[ \t]+/, "", k); sub(/[ \t]+$/, "", k)
-                sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
-                gsub(/"/, "\\\"", k); gsub(/"/, "\\\"", v)
-                if (count > 0) printf ", "
-                printf "\"%s\": \"%s\"", k, v
-                count++
-            }
-        }
-        END { printf "}" }
-        ' header.txt)
-        ARJUN_CMD="$ARJUN_CMD --headers '$ARJUN_HEADERS_JSON'"
-    fi
-    # Arjun v2.2.7 has a known bug. We will capture and print the error cleanly if it crashes, but let the script continue.
-    eval "$ARJUN_CMD" || {
-        echo "[-] Arjun encountered an error on some hosts. See above for details."
-        echo "[-] The script is continuing to the next phase..."
-    }
-    
-    if [ -s "$TMP_DIR/arjun_results.txt" ]; then
-        echo "[+] Hidden parameters found by Arjun!"
-        # Arjun output is text by default, but it's hard to parse reliably. 
-        # For safety and to prevent path corruption, we'll extract just the raw URLs it found
-        # (meaning those URLs *have* hidden params) and pass them back through gf/qsreplace if needed.
-        # But wait, Arjun's -oT output format is "URL : param1, param2"
-        # We can extract the URL and append the first param safely using awk.
-        cat "$TMP_DIR/arjun_results.txt" | awk '{
-            url=$1
-            if($2 == ":") {
-                param=$3
-                sub(/,/, "", param)
-                if(url ~ /\?/) { print url "&" param "=FUZZ" }
-                else { print url "?" param "=FUZZ" }
-            }
-        }' >> "$TMP_DIR/fuzzable_urls.txt"
-    fi
-else
-    echo "[-] arjun not installed, skipping..."
-fi
+# Phase 3.8 (Arjun) removed: Redundant with x8 (Phase 3.9) which is faster (Rust-based)
+# and already has robust WAF-evasion. Running both doubled scan time and WAF ban risk.
 
-echo -e "\n================================================="
-echo " PHASE 3.9: Parameter Discovery Fallback (x8)"
-echo "================================================="
+phase_start "PHASE 3.9: Parameter Discovery (x8)"
 load_headers
 check_auth_status
 if command -v x8 &> /dev/null; then
@@ -417,10 +437,9 @@ if command -v x8 &> /dev/null; then
 else
     echo "[-] x8 not installed, skipping..."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 4: Vulnerability Scanning (Nuclei)"
-echo "================================================="
+phase_start "PHASE 4: Vulnerability Scanning (Nuclei)"
 load_headers
 check_auth_status
 
@@ -429,23 +448,23 @@ nuclei -l "$TMP_DIR/live_hosts.txt" "${HEADER_ARGS[@]}" -tags cve,misconfig,pane
 
 echo "[*] Running DAST Nuclei Scan on parameters..."
 if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
-    cat "$TMP_DIR/fuzzable_urls.txt" | nuclei "${HEADER_ARGS[@]}" -tags dast -dast -rl $RATE_LIMIT_NUCLEI -o "$TMP_DIR/nuclei_dast.txt"
+    # Strip =FUZZ so Nuclei recognizes the parameters normally (FUZZ is for ffuf/SQLMap, not Nuclei)
+    cat "$TMP_DIR/fuzzable_urls.txt" | sed 's/=FUZZ/=/g' | nuclei "${HEADER_ARGS[@]}" -tags dast -dast -rl $RATE_LIMIT_NUCLEI -o "$TMP_DIR/nuclei_dast.txt"
 else
     echo "[-] No fuzzable parameters found, skipping DAST."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 4.8: Automated SQL Injection (SQLMap)"
-echo "================================================="
+phase_start "PHASE 4.5: Automated SQL Injection (SQLMap)"
 load_headers
 check_auth_status
 if command -v sqlmap &> /dev/null; then
     if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
-        echo "[*] Running SQLMap on fuzzable URLs (Risk 3, Level 3)..."
+        echo "[*] Running SQLMap on fuzzable URLs (Level 2, Risk 2)..."
         # Create a clean target list replacing FUZZ with empty to let sqlmap dynamically test
         cat "$TMP_DIR/fuzzable_urls.txt" | sed 's/FUZZ//g' | urldedupe -s > "$TMP_DIR/sqlmap_targets.txt"
         
-        SQLMAP_CMD="sqlmap -m \"$TMP_DIR/sqlmap_targets.txt\" --batch --random-agent --retries=1 --level=3 --risk=3 --tamper=between --dbs -o --output-dir=\"$SAVE_DIR/$escapedUrl/sqlmap\""
+        SQLMAP_CMD="sqlmap -m \"$TMP_DIR/sqlmap_targets.txt\" --batch --random-agent --retries=1 --level=2 --risk=2 --tamper=between --dbs -o --output-dir=\"$SAVE_DIR/$escapedUrl/sqlmap\""
         
         if [ -n "$SQLMAP_DBMS" ]; then
             SQLMAP_CMD="$SQLMAP_CMD --dbms=\"$SQLMAP_DBMS\""
@@ -467,10 +486,9 @@ if command -v sqlmap &> /dev/null; then
 else
     echo "[-] sqlmap not installed, skipping..."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 4.5: Advanced XSS Fuzzing (Dalfox)"
-echo "================================================="
+phase_start "PHASE 4.8: Advanced XSS Fuzzing (Dalfox)"
 load_headers
 check_auth_status
 if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
@@ -495,40 +513,54 @@ if [ -s "$TMP_DIR/fuzzable_urls.txt" ]; then
 else
     echo "[-] No fuzzable parameters found, skipping Dalfox."
 fi
+phase_end
 
-echo -e "\n================================================="
-echo " PHASE 5: Directory & File Fuzzing (Feroxbuster)"
-echo "================================================="
-load_headers
-check_auth_status
-echo "[*] Running Feroxbuster (Rate limited to $RATE_LIMIT_DIRSEARCH req/s)..."
+phase_start "PHASE 5: Directory & File Fuzzing (Feroxbuster)"
 
-if command -v feroxbuster &> /dev/null; then
-    FEROX_CMD="feroxbuster --stdin -x php,html,js,json,bak,txt,zip,tar.gz -C 400,403,404,500 --rate-limit $RATE_LIMIT_DIRSEARCH --dont-scan '.*(logout|signout|logoff|delete|remove|destroy|revoke|kill|update).*' -q -o \"$TMP_DIR/feroxbuster_results.txt\""
-
-    if [ -f "header.txt" ] && [ -s "header.txt" ]; then
-        echo "[+] Injecting authentication headers into Feroxbuster..."
-        while IFS= read -r line || [ -n "$line" ]; do
-            line=$(echo "$line" | tr -d '\r')
-            if [ -n "$line" ]; then
-                FEROX_CMD="$FEROX_CMD -H \"$line\""
-            fi
-        done < "header.txt"
-    fi
-
-    eval "cat \"$TMP_DIR/live_hosts.txt\" | $FEROX_CMD"
-    echo "[+] Feroxbuster completed."
+if [ "$SKIP_DIRSCAN" = true ]; then
+    echo "[*] Skipping Directory Fuzzing as requested."
 else
-    echo "[-] feroxbuster not installed. Please install it to run this phase."
-fi
+    load_headers
+    check_auth_status
+    echo "[*] Running Feroxbuster (Rate limited to $RATE_LIMIT_DIRSEARCH req/s)..."
 
-echo -e "\n================================================="
-echo " PHASE 6: Compiling Results & Cleanup"
-echo "================================================="
+    if command -v feroxbuster &> /dev/null; then
+        # --depth 1: prevents endless recursive rabbit holes (each discovered dir would spawn a full new scan)
+        # Trimmed extensions: removed html, js, json — Katana/Hakrawler already found the visible ones.
+        # Only fuzz for high-value hidden files (backups, archives, config text, php logic).
+        FEROX_CMD="feroxbuster --stdin --depth 1 -x php,bak,txt,zip,tar.gz -C 400,403,404,500 --rate-limit $RATE_LIMIT_DIRSEARCH --dont-scan '.*(logout|signout|logoff|delete|remove|destroy|revoke|kill|update|/assets/).*' -q -o \"$TMP_DIR/feroxbuster_results.txt\""
+
+        if [ -f "header.txt" ] && [ -s "header.txt" ]; then
+            echo "[+] Injecting authentication headers into Feroxbuster..."
+            while IFS= read -r line || [ -n "$line" ]; do
+                line=$(echo "$line" | tr -d '\r')
+                if [ -n "$line" ]; then
+                    FEROX_CMD="$FEROX_CMD -H \"$line\""
+                fi
+            done < "header.txt"
+        fi
+
+        eval "cat \"$TMP_DIR/live_hosts.txt\" | $FEROX_CMD"
+        echo "[+] Feroxbuster completed."
+    else
+        echo "[-] feroxbuster not installed. Please install it to run this phase."
+    fi
+fi
+phase_end
+
+phase_start "PHASE 6: Compiling Results & Cleanup"
 # Only compile the actual findings, not the massive raw URL lists
 cat "$TMP_DIR/live_hosts_info.txt" "$TMP_DIR"/nuclei_*.txt "$TMP_DIR/subzy_results.txt" "$TMP_DIR/dalfox_xss.txt" "$TMP_DIR/feroxbuster_results.txt" 2>/dev/null | anew "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
 
-if [ "$TELEGRAM_NOTIF" = true ]; then
+# Include SQLMap results summary if they exist
+if [ -d "$SAVE_DIR/$escapedUrl/sqlmap" ]; then
+    echo "--- SQLMap Results ---" >> "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
+    find "$SAVE_DIR/$escapedUrl/sqlmap" -name "log" -exec grep -l "is vulnerable" {} \; 2>/dev/null | while read logfile; do
+        echo "[SQLi] $(dirname "$logfile" | xargs basename): VULNERABLE" >> "$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt"
+    done
+fi
+
+if [ "${TELEGRAM_NOTIF:-false}" = true ]; then
   echo "[*] Sending results to Telegram..."
   curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
        -F document=@"$SAVE_DIR/$escapedUrl/final-recon-$escapedUrl.txt" \
@@ -539,5 +571,11 @@ fi
 
 echo "[*] Cleaning up temporary files..."
 rm -rf "$TMP_DIR"
+phase_end
 
-echo "[+] Pipeline Complete! Results saved to $SAVE_DIR/$escapedUrl/"
+PIPELINE_END=$(date +%s)
+TOTAL_ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
+TOTAL_MINS=$(( TOTAL_ELAPSED / 60 ))
+TOTAL_SECS=$(( TOTAL_ELAPSED % 60 ))
+echo -e "\n[+] Pipeline Complete! Total time: ${TOTAL_MINS}m ${TOTAL_SECS}s"
+echo "[+] Results saved to $SAVE_DIR/$escapedUrl/"
